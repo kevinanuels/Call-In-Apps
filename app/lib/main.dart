@@ -79,6 +79,37 @@ class CallController extends ChangeNotifier {
   Timer? _ringTimeout;
   Timer? _ticker;
   static const _tones = MethodChannel('poc_call/tones');
+  static const _bg = MethodChannel('poc_call/background');
+
+  // Background support (foreground service + notifications)
+  bool foreground = true; // app visible? set from lifecycle observer
+  bool askBackgroundSetup = false;
+  bool _serviceStarted = false;
+
+  Future<T?> bgInvoke<T>(String method, [Map<String, dynamic>? args]) async {
+    try {
+      return await _bg.invokeMethod<T>(method, args);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String get _idleServiceText => registered ? 'Connected · ready for calls' : 'Reconnecting…';
+
+  Future<void> _serviceIdle() async {
+    if (!_serviceStarted) return;
+    await bgInvoke('startService', {'text': _idleServiceText, 'inCall': false});
+  }
+
+  Future<void> _checkBackgroundSetup() async {
+    final done = await bgInvoke<bool>('getFlag', {'key': 'bg_onboarded'});
+    if (done != true) {
+      askBackgroundSetup = true;
+      notifyListeners();
+    }
+  }
+
+  Future<void> markBackgroundOnboarded() => bgInvoke('setFlag', {'key': 'bg_onboarded', 'value': true});
 
   static final Map<String, dynamic> _iceConfig = {
     'iceServers': [
@@ -121,6 +152,7 @@ class CallController extends ChangeNotifier {
     _ping?.cancel();
     registered = false;
     connecting = false;
+    if (_serviceStarted) bgInvoke('updateText', {'text': 'Reconnecting…'});
     if (state == CallState.calling || state == CallState.ringing || state == CallState.incoming) {
       _finish('Call failed: lost connection to the server', alert: true);
     }
@@ -156,6 +188,8 @@ class CallController extends ChangeNotifier {
     registered = false;
     connecting = false;
     error = null;
+    _serviceStarted = false;
+    bgInvoke('stopService');
     notifyListeners();
   }
 
@@ -172,6 +206,15 @@ class CallController extends ChangeNotifier {
         error = null;
         _everRegistered = true;
         _retry = 0;
+        if (!_serviceStarted) {
+          _serviceStarted = true;
+          bgInvoke('startService', {'text': 'Connected · ready for calls', 'inCall': false});
+          _checkBackgroundSetup();
+        } else {
+          bgInvoke('updateText', {
+            'text': state == CallState.connected ? 'In call with $peerId' : 'Connected · ready for calls'
+          });
+        }
         _ping?.cancel();
         _ping = Timer.periodic(const Duration(seconds: 4), (_) {
           final ch = _ws;
@@ -208,6 +251,7 @@ class CallController extends ChangeNotifier {
         duration = Duration.zero;
         _send({'type': 'ringing', 'to': from});
         _playTone('ring');
+        if (!foreground) bgInvoke('showIncoming', {'caller': from});
         _openCallPage();
         notifyListeners();
         break;
@@ -309,6 +353,7 @@ class CallController extends ChangeNotifier {
   Future<void> accept() async {
     if (state != CallState.incoming) return;
     final offer = _pendingOffer!;
+    bgInvoke('cancelIncoming');
     await _stopTone();
     try {
       await _createPeer(peerId!);
@@ -326,6 +371,7 @@ class CallController extends ChangeNotifier {
 
   void decline() {
     if (state != CallState.incoming) return;
+    bgInvoke('cancelIncoming');
     _send({'type': 'reject', 'to': peerId});
     _finish('Call declined');
   }
@@ -353,6 +399,8 @@ class CallController extends ChangeNotifier {
   }
 
   void _onConnected() {
+    bgInvoke('cancelIncoming');
+    if (_serviceStarted) bgInvoke('startService', {'text': 'In call with $peerId', 'inCall': true});
     state = CallState.connected;
     statusText = 'Connected';
     reconnecting = false;
@@ -576,7 +624,9 @@ class CallController extends ChangeNotifier {
     statusText = wasConnected ? '$reason · ${formatDuration(d)}' : reason;
     notifyListeners();
     await _stopTone();
+    bgInvoke('cancelIncoming');
     await _teardown();
+    _serviceIdle();
     await Future.delayed(const Duration(milliseconds: 1500));
     state = CallState.idle;
     peerId = null;
@@ -609,12 +659,23 @@ String formatDuration(Duration d) {
 
 final ctrl = CallController();
 
-void main() => runApp(MaterialApp(
-      navigatorKey: navigatorKey,
-      title: 'In-App Call',
-      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-      home: const HomePage(),
-    ));
+class _Lifecycle with WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    ctrl.foreground = s == AppLifecycleState.resumed;
+  }
+}
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  WidgetsBinding.instance.addObserver(_Lifecycle());
+  runApp(MaterialApp(
+    navigatorKey: navigatorKey,
+    title: 'In-App Call',
+    theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+    home: const HomePage(),
+  ));
+}
 
 // ======================= Page 1: login + dial =======================
 class HomePage extends StatefulWidget {
@@ -719,6 +780,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onCtrl() {
+    if (ctrl.askBackgroundSetup && mounted) {
+      ctrl.askBackgroundSetup = false;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        await showDialog<void>(context: context, builder: (_) => const BackgroundSetupDialog());
+        await ctrl.markBackgroundOnboarded();
+      });
+    }
     final msg = ctrl.notice;
     if (msg == null || !mounted) return;
     final alert = ctrl.noticeIsAlert;
@@ -831,6 +900,15 @@ class _HomePageState extends State<HomePage> {
                     label: const Text('Check for updates'),
                   ),
                 ),
+                if (ctrl.registered)
+                  Center(
+                    child: TextButton.icon(
+                      onPressed: () => showDialog<void>(
+                          context: context, builder: (_) => const BackgroundSetupDialog()),
+                      icon: const Icon(Icons.notifications_active_outlined, size: 18),
+                      label: const Text('Background & notification settings'),
+                    ),
+                  ),
                 Center(child: Text('v$kAppVersion', style: const TextStyle(color: Colors.grey))),
               ]),
             ),
@@ -975,5 +1053,76 @@ class _RoundButton extends StatelessWidget {
       const SizedBox(height: 8),
       Text(label, style: const TextStyle(color: Colors.white70)),
     ]);
+  }
+}
+
+
+// ======================= Background setup dialog =======================
+class BackgroundSetupDialog extends StatefulWidget {
+  const BackgroundSetupDialog({super.key});
+  @override
+  State<BackgroundSetupDialog> createState() => _BackgroundSetupDialogState();
+}
+
+class _BackgroundSetupDialogState extends State<BackgroundSetupDialog> with WidgetsBindingObserver {
+  Map<dynamic, dynamic> _st = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _refresh(); // came back from a settings screen
+  }
+
+  Future<void> _refresh() async {
+    final st = await ctrl.bgInvoke<Map<dynamic, dynamic>>('status');
+    if (mounted && st != null) setState(() => _st = st);
+  }
+
+  Widget _row(String title, String why, bool? ok, Future<void> Function() action) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(ok == true ? Icons.check_circle : Icons.radio_button_unchecked,
+          color: ok == true ? Colors.green : Colors.grey),
+      title: Text(title),
+      subtitle: Text(why),
+      onTap: ok == true ? null : () async { await action(); await _refresh(); },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Receive calls in background'),
+      content: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('To ring when the app is closed or the screen is off, allow these:'),
+          const SizedBox(height: 8),
+          _row('Notifications', 'Shows "connected" and incoming calls', _st['notifications'] as bool?, () async {
+            final granted = await ctrl.bgInvoke<bool>('requestNotifPermission');
+            if (granted != true) await ctrl.bgInvoke('openNotificationSettings');
+          }),
+          _row('Unrestricted battery', 'Stops Android from pausing the app', _st['battery'] as bool?,
+              () => ctrl.bgInvoke('openBatterySettings')),
+          _row('Calls on lock screen', 'Wakes the screen for incoming calls (Android 14+)',
+              _st['fullScreen'] as bool?, () => ctrl.bgInvoke('openFullScreenSettings')),
+          const SizedBox(height: 8),
+          const Text("Note: don't swipe the app away from recent apps; that closes the connection.",
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+        ]),
+      ),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Done'))],
+    );
   }
 }
