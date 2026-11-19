@@ -1,0 +1,17 @@
+name: poc_call
+description: POC in-app audio call (Android to Android) using WebRTC.
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_webrtc: ^0.12.0
+  web_socket_channel: ^3.0.0
+  permission_handler: ^11.3.0
+
+flutter:
+  uses-material-design: true
