@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart' hide AndroidAudioMode;
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const kServerUrl =
@@ -11,6 +11,8 @@ const kServerUrl =
 const _turnUrl = String.fromEnvironment('TURN_URL');
 const _turnUser = String.fromEnvironment('TURN_USER');
 const _turnCred = String.fromEnvironment('TURN_CRED');
+// Set false (--dart-define=DIAG=false) to hide the grey diagnostics line.
+const kDiag = bool.fromEnvironment('DIAG', defaultValue: true);
 const kRingTimeout = Duration(seconds: 45);
 // How long a connected call may stay in "Reconnecting…" before it fails.
 const kReconnectTimeout = Duration(seconds: 60);
@@ -74,7 +76,7 @@ class CallController extends ChangeNotifier {
   final List<RTCIceCandidate> _earlyIce = [];
   Timer? _ringTimeout;
   Timer? _ticker;
-  final AudioPlayer _tone = AudioPlayer();
+  static const _tones = MethodChannel('poc_call/tones');
 
   static final Map<String, dynamic> _iceConfig = {
     'iceServers': [
@@ -203,7 +205,7 @@ class CallController extends ChangeNotifier {
         muted = false;
         duration = Duration.zero;
         _send({'type': 'ringing', 'to': from});
-        _playTone('ring.wav', inCall: false);
+        _playTone('ring');
         _openCallPage();
         notifyListeners();
         break;
@@ -211,7 +213,7 @@ class CallController extends ChangeNotifier {
         if (state == CallState.calling && from == peerId) {
           state = CallState.ringing;
           statusText = 'Ringing…';
-          _playTone('ringback.wav', inCall: true);
+          _playTone('ringback');
           notifyListeners();
         }
         break;
@@ -383,7 +385,9 @@ class CallController extends ChangeNotifier {
     try {
       await Helper.setSpeakerphoneOn(speakerOn);
     } catch (_) {}
+    final thisPc = _pc;
     _pc!.onConnectionState = (s) {
+      if (_pc != thisPc) return;
       _pcState = s.name.replaceFirst('RTCPeerConnectionState', '');
       notifyListeners();
       if (state != CallState.connected) return;
@@ -396,6 +400,7 @@ class CallController extends ChangeNotifier {
     };
     // Also watch ICE state directly: some Android builds report it more reliably.
     _pc!.onIceConnectionState = (s) {
+      if (_pc != thisPc) return;
       _iceState = s.name.replaceFirst('RTCIceConnectionState', '');
       notifyListeners();
       if (state != CallState.connected) return;
@@ -536,26 +541,11 @@ class CallController extends ChangeNotifier {
   }
 
   // ---------- tones ----------
-  Future<void> _playTone(String asset, {required bool inCall}) async {
+  // Native tones (see native/MainActivity.kt): system ringback / default ringtone.
+  Future<void> _playTone(String kind) async {
     try {
       toneError = null;
-      await _tone.stop();
-      // Caller's mic is already open (call-audio mode): play on the call-signalling stream.
-      await _tone.setAudioContext(AudioContext(
-        android: AudioContextAndroid(
-          isSpeakerphoneOn: inCall ? speakerOn : false,
-          stayAwake: false,
-          contentType: AndroidContentType.sonification,
-          usageType: inCall
-              ? AndroidUsageType.voiceCommunicationSignalling
-              : AndroidUsageType.notificationRingtone,
-          audioFocus: inCall ? AndroidAudioFocus.none : AndroidAudioFocus.gain,
-          audioMode: inCall ? AndroidAudioMode.inCommunication : AndroidAudioMode.normal,
-        ),
-      ));
-      await _tone.setVolume(1.0);
-      await _tone.setReleaseMode(ReleaseMode.loop);
-      await _tone.play(AssetSource(asset));
+      await _tones.invokeMethod(kind == 'ring' ? 'startRing' : 'startRingback');
     } catch (e) {
       toneError = 'Tone error: $e';
       notifyListeners();
@@ -564,7 +554,7 @@ class CallController extends ChangeNotifier {
 
   Future<void> _stopTone() async {
     try {
-      await _tone.stop();
+      await _tones.invokeMethod('stop');
     } catch (_) {}
   }
 
@@ -813,6 +803,7 @@ class CallPage extends StatelessWidget {
                       color: Colors.white, fontSize: 40, fontWeight: FontWeight.w300),
                 ),
                 const Spacer(flex: 3),
+                if (kDiag)
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   child: Text(
