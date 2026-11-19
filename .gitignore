@@ -2,3 +2,7 @@ node_modules/
 build/
 .dart_tool/
 android/
+server/monitor.js
+server/.env
+server/blocked.json
+server/setup-telegram.sh

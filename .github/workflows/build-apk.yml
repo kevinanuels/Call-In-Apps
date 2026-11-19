@@ -18,7 +18,6 @@ jobs:
           flutter create --platforms=android --project-name poc_call --org com.example .
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.RECORD_AUDIO"/><uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/><uses-permission android:name="android.permission.BLUETOOTH"/>\n    <application#' $M
-          sed -i 's#<application#<application android:usesCleartextTraffic="true"#' $M
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle* 
           grep -n "minSdk" android/app/build.gradle*
           mkdir -p android/app/src/main/kotlin/com/example/poc_call

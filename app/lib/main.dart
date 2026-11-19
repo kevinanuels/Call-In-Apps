@@ -7,7 +7,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const kServerUrl =
-    String.fromEnvironment('SERVER_URL', defaultValue: 'ws://139.190.99.158:8080');
+    String.fromEnvironment('SERVER_URL', defaultValue: 'wss://apps.eyenithing.site');
 const _turnUrl = String.fromEnvironment('TURN_URL');
 const _turnUser = String.fromEnvironment('TURN_USER');
 const _turnCred = String.fromEnvironment('TURN_CRED');
