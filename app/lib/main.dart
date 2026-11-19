@@ -3,7 +3,6 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() => runApp(const MaterialApp(home: CallPage()));
@@ -113,9 +112,6 @@ class _CallPageState extends State<CallPage> {
 
   // ---------- WebRTC ----------
   Future<void> _createPeer(String remoteId) async {
-    if (!await Permission.microphone.request().isGranted) {
-      throw Exception('Microphone permission denied');
-    }
     _localStream = await navigator.mediaDevices
         .getUserMedia({'audio': true, 'video': false});
     _pc = await createPeerConnection(_iceConfig);
