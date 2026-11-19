@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'updater.dart';
+
 const kServerUrl =
     String.fromEnvironment('SERVER_URL', defaultValue: 'wss://apps.eyenithing.site');
 const _turnUrl = String.fromEnvironment('TURN_URL');
@@ -629,6 +631,85 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     ctrl.addListener(_onCtrl);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkUpdate(silent: true));
+  }
+
+  bool _updating = false;
+
+  Future<void> _checkUpdate({bool silent = false}) async {
+    if (_updating) return;
+    final u = await checkForUpdate();
+    if (!mounted) return;
+    if (u == null) {
+      if (!silent) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('You have the latest version (v$kAppVersion).')));
+      }
+      return;
+    }
+    if (ctrl.state != CallState.idle) return; // never interrupt a call
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        icon: const Icon(Icons.system_update),
+        title: const Text('Update available'),
+        content: Text('Version ${u.version} is available (you have v$kAppVersion).'
+            '${u.notes.isNotEmpty ? '\n\n${u.notes}' : ''}'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Later')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Update')),
+        ],
+      ),
+    );
+    if (go == true && mounted) await _runUpdate(u);
+  }
+
+  Future<void> _runUpdate(UpdateInfo u) async {
+    _updating = true;
+    final progress = ValueNotifier<double>(0);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('Downloading update…'),
+          content: ValueListenableBuilder<double>(
+            valueListenable: progress,
+            builder: (_, v, __) => Column(mainAxisSize: MainAxisSize.min, children: [
+              LinearProgressIndicator(value: v > 0 ? v : null),
+              const SizedBox(height: 12),
+              Text('${(v * 100).toStringAsFixed(0)}%'),
+            ]),
+          ),
+        ),
+      ),
+    );
+    String? msg;
+    try {
+      final path = await downloadApk(u, (v) => progress.value = v);
+      if (mounted) Navigator.of(context, rootNavigator: true).pop(); // close progress dialog
+      final r = await installApk(path);
+      if (r == 'needs_permission') {
+        msg = 'Allow "Install unknown apps" for this app in the settings that just opened, '
+            'then come back and tap Check for updates again.';
+      }
+    } catch (e) {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      msg = 'Update failed: $e';
+    } finally {
+      _updating = false;
+    }
+    if (msg != null && mounted) {
+      showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Update'),
+          content: Text(msg!),
+          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+        ),
+      );
+    }
   }
 
   @override
@@ -742,6 +823,15 @@ class _HomePageState extends State<HomePage> {
                       child: Text("You can't call yourself.", textAlign: TextAlign.center),
                     ),
                 ],
+                const SizedBox(height: 32),
+                Center(
+                  child: TextButton.icon(
+                    onPressed: () => _checkUpdate(),
+                    icon: const Icon(Icons.system_update_alt, size: 18),
+                    label: const Text('Check for updates'),
+                  ),
+                ),
+                Center(child: Text('v$kAppVersion', style: const TextStyle(color: Colors.grey))),
               ]),
             ),
           ),

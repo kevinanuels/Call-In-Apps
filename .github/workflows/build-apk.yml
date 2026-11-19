@@ -17,21 +17,39 @@ jobs:
         run: |
           flutter create --platforms=android --project-name poc_call --org com.example .
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.RECORD_AUDIO"/><uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/><uses-permission android:name="android.permission.BLUETOOTH"/>\n    <application#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.RECORD_AUDIO"/><uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/><uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/><uses-permission android:name="android.permission.BLUETOOTH"/><uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>\n    <application#' $M
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle* 
           grep -n "minSdk" android/app/build.gradle*
+          # FileProvider so the app can hand the downloaded APK to the installer
+          sed -i 's#</application>#<provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/></provider></application>#' $M
+          mkdir -p android/app/src/main/res/xml
+          cp native/file_paths.xml android/app/src/main/res/xml/file_paths.xml
+          # Stable release signing (required for in-place updates)
+          echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > android/release.keystore
+          test -f android/app/build.gradle.kts
+          sed -i 's#buildTypes {#signingConfigs { create("release") { storeFile = file("../release.keystore"); storePassword = System.getenv("KS_PASS"); keyAlias = System.getenv("KS_ALIAS"); keyPassword = System.getenv("KS_PASS") } }\n    buildTypes {#' android/app/build.gradle.kts
+          sed -i 's#signingConfigs.getByName("debug")#signingConfigs.getByName("release")#' android/app/build.gradle.kts
+          grep -n "signingConfig" android/app/build.gradle.kts
           mkdir -p android/app/src/main/kotlin/com/example/poc_call
           cp native/MainActivity.kt android/app/src/main/kotlin/com/example/poc_call/MainActivity.kt
           find android/app/src/main -name 'MainActivity*'
           flutter pub get
       - name: Build APK
         working-directory: app
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KS_PASS }}
+          KS_ALIAS: ${{ secrets.ANDROID_KS_ALIAS }}
         run: |
+          APP_VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')
+          echo "Building version $APP_VERSION"
           flutter build apk --release \
+            --dart-define=APP_VERSION=$APP_VERSION \
             --dart-define=SERVER_URL=${{ vars.SERVER_URL }} \
             --dart-define=TURN_URL=${{ vars.TURN_URL }} \
             --dart-define=TURN_USER=${{ secrets.TURN_USER }} \
             --dart-define=TURN_CRED=${{ secrets.TURN_CRED }}
+      - name: Show signing certificate
+        run: keytool -printcert -jarfile app/build/app/outputs/flutter-apk/app-release.apk | grep -E "Owner|SHA256"
       - uses: actions/upload-artifact@v4
         with:
           name: poc-call-apk
