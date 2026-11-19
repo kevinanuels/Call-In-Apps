@@ -1,7 +1,7 @@
 name: poc_call
 description: POC in-app audio call (Android to Android) using WebRTC.
 publish_to: none
-version: 1.6.1+8
+version: 1.6.2+9
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

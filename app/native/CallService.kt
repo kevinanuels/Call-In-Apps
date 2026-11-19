@@ -14,7 +14,7 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 object CallNotifications {
-    const val IDLE_CH = "poc_call_idle"     // importance MIN: no status-bar icon
+    const val IDLE_CH = "poc_call_idle2"    // importance MIN + hidden on lock screen
     const val ACTIVE_CH = "poc_call_active" // shown during a call
     const val INCOMING_CH = "poc_call_incoming"
     const val SERVICE_ID = 1
@@ -23,11 +23,13 @@ object CallNotifications {
     fun ensureChannels(ctx: Context) {
         if (Build.VERSION.SDK_INT < 26) return
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.deleteNotificationChannel("poc_call_service") // old channel (was visible in the top bar)
+        nm.deleteNotificationChannel("poc_call_service") // old channels
+        nm.deleteNotificationChannel("poc_call_idle")
         nm.createNotificationChannel(
             NotificationChannel(IDLE_CH, "Background connection", NotificationManager.IMPORTANCE_MIN).apply {
                 description = "Silent: keeps the app connected so you can receive calls"
                 setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
             })
         nm.createNotificationChannel(
             NotificationChannel(ACTIVE_CH, "Ongoing call", NotificationManager.IMPORTANCE_LOW).apply {
@@ -60,6 +62,7 @@ object CallNotifications {
             .setSilent(true)
             .setShowWhen(false)
             .setPriority(if (inCall) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_MIN)
+            .setVisibility(if (inCall) NotificationCompat.VISIBILITY_PUBLIC else NotificationCompat.VISIBILITY_SECRET)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openApp(ctx, false))
             .build()
