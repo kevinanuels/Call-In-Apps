@@ -152,7 +152,9 @@ class CallController extends ChangeNotifier {
     _ping?.cancel();
     registered = false;
     connecting = false;
-    if (_serviceStarted) bgInvoke('updateText', {'text': 'Reconnecting…'});
+    if (_serviceStarted) {
+      bgInvoke('updateText', {'text': 'Reconnecting…', 'inCall': state == CallState.connected});
+    }
     if (state == CallState.calling || state == CallState.ringing || state == CallState.incoming) {
       _finish('Call failed: lost connection to the server', alert: true);
     }
@@ -211,8 +213,10 @@ class CallController extends ChangeNotifier {
           bgInvoke('startService', {'text': 'Connected · ready for calls', 'inCall': false});
           _checkBackgroundSetup();
         } else {
+          final inCall = state == CallState.connected;
           bgInvoke('updateText', {
-            'text': state == CallState.connected ? 'In call with $peerId' : 'Connected · ready for calls'
+            'text': inCall ? 'In call with $peerId' : 'Connected · ready for calls',
+            'inCall': inCall,
           });
         }
         _ping?.cancel();

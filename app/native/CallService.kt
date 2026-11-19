@@ -14,7 +14,8 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 object CallNotifications {
-    const val SERVICE_CH = "poc_call_service"
+    const val IDLE_CH = "poc_call_idle"     // importance MIN: no status-bar icon
+    const val ACTIVE_CH = "poc_call_active" // shown during a call
     const val INCOMING_CH = "poc_call_incoming"
     const val SERVICE_ID = 1
     const val INCOMING_ID = 2
@@ -22,9 +23,15 @@ object CallNotifications {
     fun ensureChannels(ctx: Context) {
         if (Build.VERSION.SDK_INT < 26) return
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.deleteNotificationChannel("poc_call_service") // old channel (was visible in the top bar)
         nm.createNotificationChannel(
-            NotificationChannel(SERVICE_CH, "Call connection", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Keeps the app connected so you can receive calls"
+            NotificationChannel(IDLE_CH, "Background connection", NotificationManager.IMPORTANCE_MIN).apply {
+                description = "Silent: keeps the app connected so you can receive calls"
+                setShowBadge(false)
+            })
+        nm.createNotificationChannel(
+            NotificationChannel(ACTIVE_CH, "Ongoing call", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Shown while you are in a call"
                 setShowBadge(false)
             })
         nm.createNotificationChannel(
@@ -44,13 +51,15 @@ object CallNotifications {
             ctx, if (incoming) 1 else 0, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
-    fun service(ctx: Context, text: String): Notification =
-        NotificationCompat.Builder(ctx, SERVICE_CH)
+    fun service(ctx: Context, text: String, inCall: Boolean = false): Notification =
+        NotificationCompat.Builder(ctx, if (inCall) ACTIVE_CH else IDLE_CH)
             .setSmallIcon(android.R.drawable.stat_sys_phone_call)
-            .setContentTitle("In-App Call")
+            .setContentTitle(if (inCall) "Ongoing call" else "In-App Call")
             .setContentText(text)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setPriority(if (inCall) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_MIN)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openApp(ctx, false))
             .build()
@@ -81,7 +90,7 @@ class CallService : Service() {
         val text = intent?.getStringExtra("text") ?: "Connected · ready for calls"
         val inCall = intent?.getBooleanExtra("inCall", false) ?: false
         CallNotifications.ensureChannels(this)
-        val n = CallNotifications.service(this, text)
+        val n = CallNotifications.service(this, text, inCall)
         if (!startFg(n, inCall) && !startFg(n, false)) {
             stopSelf()
             return START_NOT_STICKY

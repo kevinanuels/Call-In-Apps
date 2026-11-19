@@ -80,14 +80,15 @@ class MainActivity : FlutterActivity() {
                             } catch (e: Exception) {
                                 // Not allowed from background: at least refresh the text.
                                 CallNotifications.ensureChannels(this)
-                                nm.notify(CallNotifications.SERVICE_ID, CallNotifications.service(this, text))
+                                nm.notify(CallNotifications.SERVICE_ID, CallNotifications.service(this, text, inCall))
                                 result.success("fallback")
                             }
                         }
                         "updateText" -> {
                             CallNotifications.ensureChannels(this)
                             nm.notify(CallNotifications.SERVICE_ID,
-                                CallNotifications.service(this, call.argument<String>("text") ?: ""))
+                                CallNotifications.service(this, call.argument<String>("text") ?: "",
+                                    call.argument<Boolean>("inCall") ?: false))
                             result.success(null)
                         }
                         "stopService" -> {
