@@ -3,7 +3,7 @@ import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' hide AndroidAudioMode;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const kServerUrl =
