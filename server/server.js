@@ -8,7 +8,10 @@ const users = new Map(); // id -> ws
 
 wss.on('connection', (ws) => {
   let myId = null;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (raw) => {
+    ws.isAlive = true;
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     if (msg.type === 'register') {
@@ -19,6 +22,7 @@ wss.on('connection', (ws) => {
       console.log('registered', myId);
       return;
     }
+    if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return; }
     if (!myId || !msg.to) return;
     const target = users.get(msg.to);
     if (!target || target.readyState !== 1) {
@@ -33,3 +37,12 @@ wss.on('connection', (ws) => {
   });
 });
 httpServer.listen(PORT, () => console.log(`Signaling server on port ${PORT}`));
+
+// Drop half-open connections so stale registrations don't linger.
+setInterval(() => {
+  wss.clients.forEach((c) => {
+    if (!c.isAlive) return c.terminate();
+    c.isAlive = false;
+    c.ping();
+  });
+}, 30000);

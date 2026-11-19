@@ -12,6 +12,8 @@ const _turnUrl = String.fromEnvironment('TURN_URL');
 const _turnUser = String.fromEnvironment('TURN_USER');
 const _turnCred = String.fromEnvironment('TURN_CRED');
 const kRingTimeout = Duration(seconds: 45);
+// How long a connected call may stay in "Reconnecting…" before it fails.
+const kReconnectTimeout = Duration(seconds: 30);
 
 final navigatorKey = GlobalKey<NavigatorState>();
 final emailRe = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
@@ -26,6 +28,12 @@ class CallController extends ChangeNotifier {
   bool connecting = false;
   String? myId;
   String? error;
+  bool _wantConnected = false;
+  bool _everRegistered = false;
+  int _retry = 0;
+  Timer? _retryTimer;
+  DateTime _lastRx = DateTime.now();
+  bool get signalLost => _everRegistered && _wantConnected && !registered;
 
   // call
   CallState state = CallState.idle;
@@ -34,6 +42,20 @@ class CallController extends ChangeNotifier {
   bool muted = false;
   Duration duration = Duration.zero;
   bool _callPageOpen = false;
+  bool isCaller = false;
+  bool reconnecting = false; // media path lost, trying to recover
+  bool poorConnection = false; // media flowing but quality is bad
+  Timer? _reconDeadline;
+  Timer? _restartTimer;
+  Timer? _statsTimer;
+  int _badStreak = 0;
+  int _goodStreak = 0;
+  num _lastRecv = 0;
+  num _lastLost = 0;
+
+  String get displayStatus => state == CallState.connected
+      ? (reconnecting ? 'Reconnecting…' : (poorConnection ? 'Poor connection' : 'Connected'))
+      : statusText;
 
   // one-shot message for the home page (dialog if alert, snackbar otherwise)
   String? notice;
@@ -58,34 +80,62 @@ class CallController extends ChangeNotifier {
   // ---------- connection ----------
   void connect(String email) {
     myId = email.trim().toLowerCase();
-    connecting = true;
+    _wantConnected = true;
+    _everRegistered = false;
+    _retry = 0;
     error = null;
+    _open();
+  }
+
+  void _open() {
+    _retryTimer?.cancel();
+    connecting = true;
     notifyListeners();
     _ws?.sink.close();
     final ch = WebSocketChannel.connect(Uri.parse(kServerUrl));
     _ws = ch;
+    _lastRx = DateTime.now();
     ch.ready.then((_) {
       if (_ws == ch) _send({'type': 'register', 'id': myId});
-    }).catchError((e) {
-      if (_ws == ch) {
-        connecting = false;
-        registered = false;
-        error = 'Cannot reach the server. Check your internet and try again.';
-        notifyListeners();
-      }
-    });
-    ch.stream.listen(_onMessage, onError: (_) {}, onDone: () {
-      if (_ws != ch) return;
-      _ping?.cancel();
-      registered = false;
-      connecting = false;
-      if (error == null) error = 'Disconnected from server.';
-      if (state != CallState.idle) _finish('Connection lost', alert: true);
+    }).catchError((_) => _onSocketLost(ch));
+    ch.stream.listen(_onMessage,
+        onError: (_) => _onSocketLost(ch), onDone: () => _onSocketLost(ch));
+  }
+
+  // Signaling socket dropped: keep any connected call alive (audio is peer-to-peer)
+  // and reconnect in the background with backoff.
+  void _onSocketLost(WebSocketChannel ch) {
+    if (_ws != ch) return;
+    _ws = null;
+    _ping?.cancel();
+    registered = false;
+    connecting = false;
+    if (state == CallState.calling || state == CallState.ringing || state == CallState.incoming) {
+      _finish('Call failed: lost connection to the server', alert: true);
+    }
+    if (!_wantConnected) {
       notifyListeners();
+      return;
+    }
+    if (!_everRegistered) {
+      _wantConnected = false;
+      error = 'Cannot reach the server. Check your internet and try again.';
+      notifyListeners();
+      return;
+    }
+    _retry++;
+    final delay = Duration(seconds: _retry < 5 ? 1 << (_retry - 1) : 10); // 1,2,4,8,10…
+    _retryTimer?.cancel();
+    _retryTimer = Timer(delay, () {
+      if (_wantConnected && _ws == null) _open();
     });
+    notifyListeners();
   }
 
   void disconnect() {
+    _wantConnected = false;
+    _everRegistered = false;
+    _retryTimer?.cancel();
     _ping?.cancel();
     final ch = _ws;
     _ws = null;
@@ -99,6 +149,7 @@ class CallController extends ChangeNotifier {
   void _send(Map<String, dynamic> m) => _ws?.sink.add(jsonEncode(m));
 
   Future<void> _onMessage(dynamic raw) async {
+    _lastRx = DateTime.now();
     final m = jsonDecode(raw as String) as Map<String, dynamic>;
     final from = m['from'] as String?;
     switch (m['type']) {
@@ -106,9 +157,23 @@ class CallController extends ChangeNotifier {
         registered = true;
         connecting = false;
         error = null;
+        _everRegistered = true;
+        _retry = 0;
         _ping?.cancel();
-        _ping = Timer.periodic(const Duration(seconds: 25), (_) => _send({'type': 'ping'}));
+        _ping = Timer.periodic(const Duration(seconds: 10), (_) {
+          final ch = _ws;
+          if (ch == null) return;
+          if (DateTime.now().difference(_lastRx) > const Duration(seconds: 25)) {
+            ch.sink.close(); // server silent: treat as dead and reconnect
+            _onSocketLost(ch);
+            return;
+          }
+          _send({'type': 'ping'});
+        });
+        if (reconnecting) _tryRestartIce(); // signaling is back: renegotiate media now
         notifyListeners();
+        break;
+      case 'pong':
         break;
       case 'unavailable':
         if (state == CallState.calling || state == CallState.ringing) {
@@ -121,6 +186,7 @@ class CallController extends ChangeNotifier {
           return;
         }
         _pendingOffer = m;
+        isCaller = false;
         peerId = from;
         state = CallState.incoming;
         statusText = 'Incoming call';
@@ -156,6 +222,23 @@ class CallController extends ChangeNotifier {
           _earlyIce.add(c);
         }
         break;
+      case 'reoffer':
+        if (from != peerId || _pc == null) return;
+        try {
+          await _pc!.setRemoteDescription(RTCSessionDescription(m['sdp'], 'offer'));
+          final a = await _pc!.createAnswer();
+          await _pc!.setLocalDescription(a);
+          _send({'type': 'reanswer', 'to': peerId, 'sdp': a.sdp});
+        } catch (_) {}
+        break;
+      case 'reanswer':
+        if (from != peerId || _pc == null) return;
+        try {
+          if (_pc!.signalingState == RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+            await _pc!.setRemoteDescription(RTCSessionDescription(m['sdp'], 'answer'));
+          }
+        } catch (_) {}
+        break;
       case 'reject':
         if (from == peerId) _finish('$peerId declined the call', alert: true);
         break;
@@ -185,6 +268,7 @@ class CallController extends ChangeNotifier {
     final to = email.trim().toLowerCase();
     if (!registered || state != CallState.idle || to.isEmpty) return;
     peerId = to;
+    isCaller = true;
     state = CallState.calling;
     statusText = 'Calling…';
     muted = false;
@@ -248,6 +332,9 @@ class CallController extends ChangeNotifier {
   void _onConnected() {
     state = CallState.connected;
     statusText = 'Connected';
+    reconnecting = false;
+    poorConnection = false;
+    _startStats();
     duration = Duration.zero;
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -275,12 +362,112 @@ class CallController extends ChangeNotifier {
       });
     };
     _pc!.onConnectionState = (s) {
-      if (state == CallState.connected &&
-          (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-              s == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected)) {
-        _finish('Connection lost', alert: true);
+      if (state != CallState.connected) return;
+      if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _recovered();
+      } else if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          s == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        _startReconnecting();
       }
     };
+  }
+
+  // ---------- resilience: reconnect + quality ----------
+  void _startReconnecting() {
+    if (reconnecting || state != CallState.connected) return;
+    reconnecting = true;
+    poorConnection = false;
+    _reconDeadline?.cancel();
+    _reconDeadline = Timer(kReconnectTimeout, () {
+      if (!reconnecting) return;
+      _send({'type': 'hangup', 'to': peerId});
+      _finish('Call failed: connection lost', alert: true);
+    });
+    _restartTimer?.cancel();
+    _restartTimer = Timer.periodic(const Duration(seconds: 4), (_) => _tryRestartIce());
+    _tryRestartIce();
+    notifyListeners();
+  }
+
+  void _recovered() {
+    if (!reconnecting) return;
+    reconnecting = false;
+    _badStreak = 0;
+    _goodStreak = 0;
+    _reconDeadline?.cancel();
+    _restartTimer?.cancel();
+    notifyListeners();
+  }
+
+  // Only the caller renegotiates (ICE restart), which avoids offer collisions.
+  Future<void> _tryRestartIce() async {
+    final pc = _pc;
+    if (!isCaller || pc == null || !registered || state != CallState.connected) return;
+    try {
+      if (pc.signalingState == RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+        final ld = await pc.getLocalDescription(); // previous reoffer unanswered: resend it
+        if (ld != null) _send({'type': 'reoffer', 'to': peerId, 'sdp': ld.sdp});
+        return;
+      }
+      await pc.restartIce();
+      final offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      _send({'type': 'reoffer', 'to': peerId, 'sdp': offer.sdp});
+    } catch (_) {}
+  }
+
+  void _startStats() {
+    _statsTimer?.cancel();
+    _badStreak = 0;
+    _goodStreak = 0;
+    _lastRecv = 0;
+    _lastLost = 0;
+    _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) => _sampleStats());
+  }
+
+  Future<void> _sampleStats() async {
+    final pc = _pc;
+    if (pc == null || state != CallState.connected || reconnecting) return;
+    try {
+      final reports = await pc.getStats();
+      num recv = 0, lost = 0, rtt = 0, jitter = 0;
+      var hasInbound = false;
+      for (final r in reports) {
+        final v = r.values;
+        if (r.type == 'inbound-rtp' && ('${v['kind']}' == 'audio' || '${v['mediaType']}' == 'audio')) {
+          hasInbound = true;
+          recv = num.tryParse('${v['packetsReceived']}') ?? 0;
+          lost = num.tryParse('${v['packetsLost']}') ?? 0;
+          jitter = num.tryParse('${v['jitter']}') ?? 0;
+        } else if (r.type == 'candidate-pair' &&
+            ('${v['nominated']}' == 'true' || '${v['state']}' == 'succeeded')) {
+          final t = num.tryParse('${v['currentRoundTripTime']}');
+          if (t != null) rtt = t;
+        }
+      }
+      if (!hasInbound) return;
+      final dRecv = recv - _lastRecv;
+      final dLost = (lost - _lastLost) > 0 ? (lost - _lastLost) : 0;
+      _lastRecv = recv;
+      _lastLost = lost;
+      final total = dRecv + dLost;
+      final loss = total > 0 ? dLost / total : 0;
+      final bad = dRecv <= 0 || loss > 0.08 || rtt > 0.4 || jitter > 0.1;
+      if (bad) {
+        _badStreak++;
+        _goodStreak = 0;
+      } else {
+        _goodStreak++;
+        _badStreak = 0;
+      }
+      if (!poorConnection && _badStreak >= 2) {
+        poorConnection = true;
+        notifyListeners();
+      } else if (poorConnection && _goodStreak >= 2) {
+        poorConnection = false;
+        notifyListeners();
+      }
+    } catch (_) {}
   }
 
   Future<void> _teardown() async {
@@ -322,6 +509,11 @@ class CallController extends ChangeNotifier {
     state = CallState.ended; // set first so repeated events are ignored
     _ringTimeout?.cancel();
     _ticker?.cancel();
+    _reconDeadline?.cancel();
+    _restartTimer?.cancel();
+    _statsTimer?.cancel();
+    reconnecting = false;
+    poorConnection = false;
     statusText = wasConnected ? '$reason · ${formatDuration(d)}' : reason;
     notifyListeners();
     await _stopTone();
@@ -423,7 +615,7 @@ class _HomePageState extends State<HomePage> {
             child: Padding(
               padding: const EdgeInsets.all(20),
               child: ListView(children: [
-                if (!ctrl.registered) ...[
+                if (!ctrl.registered && !ctrl.signalLost) ...[
                   const SizedBox(height: 24),
                   const Icon(Icons.call, size: 64, color: Colors.teal),
                   const SizedBox(height: 16),
@@ -460,8 +652,9 @@ class _HomePageState extends State<HomePage> {
                 ] else ...[
                   Card(
                     child: ListTile(
-                      leading: const Icon(Icons.circle, color: Colors.green, size: 14),
-                      title: const Text('Connected'),
+                      leading: Icon(Icons.circle,
+                          color: ctrl.registered ? Colors.green : Colors.amber, size: 14),
+                      title: Text(ctrl.registered ? 'Connected' : 'Reconnecting…'),
                       subtitle: Text(ctrl.myId ?? ''),
                       trailing: TextButton(onPressed: ctrl.disconnect, child: const Text('Disconnect')),
                     ),
@@ -502,7 +695,7 @@ class _HomePageState extends State<HomePage> {
 
   bool _canCall() {
     final p = _peer.text.trim().toLowerCase();
-    return emailRe.hasMatch(p) && p != ctrl.myId && ctrl.state == CallState.idle;
+    return ctrl.registered && emailRe.hasMatch(p) && p != ctrl.myId && ctrl.state == CallState.idle;
   }
 }
 
@@ -533,7 +726,19 @@ class CallPage extends StatelessWidget {
                 Text(ctrl.peerId ?? '',
                     style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 12),
-                Text(ctrl.statusText, style: const TextStyle(color: Colors.white70, fontSize: 16)),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (connected && (ctrl.reconnecting || ctrl.poorConnection)) ...[
+                    Icon(ctrl.reconnecting ? Icons.wifi_off : Icons.network_check,
+                        color: Colors.amber, size: 20),
+                    const SizedBox(width: 8),
+                  ],
+                  Text(ctrl.displayStatus,
+                      style: TextStyle(
+                          color: (connected && (ctrl.reconnecting || ctrl.poorConnection))
+                              ? Colors.amber
+                              : Colors.white70,
+                          fontSize: 16)),
+                ]),
                 const SizedBox(height: 8),
                 Text(
                   connected ? formatDuration(ctrl.duration) : '',
