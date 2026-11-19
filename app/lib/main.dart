@@ -13,7 +13,7 @@ const _turnUser = String.fromEnvironment('TURN_USER');
 const _turnCred = String.fromEnvironment('TURN_CRED');
 const kRingTimeout = Duration(seconds: 45);
 // How long a connected call may stay in "Reconnecting…" before it fails.
-const kReconnectTimeout = Duration(seconds: 30);
+const kReconnectTimeout = Duration(seconds: 60);
 
 final navigatorKey = GlobalKey<NavigatorState>();
 final emailRe = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
@@ -43,6 +43,13 @@ class CallController extends ChangeNotifier {
   Duration duration = Duration.zero;
   bool _callPageOpen = false;
   bool isCaller = false;
+  bool speakerOn = true;
+  String? toneError;
+  String _pcState = '-';
+  String _iceState = '-';
+  int _restarts = 0;
+  String get debugLine =>
+      'sig:${registered ? "up" : "down"} pc:$_pcState ice:$_iceState restarts:$_restarts';
   bool reconnecting = false; // media path lost, trying to recover
   bool poorConnection = false; // media flowing but quality is bad
   Timer? _reconDeadline;
@@ -124,7 +131,9 @@ class CallController extends ChangeNotifier {
       return;
     }
     _retry++;
-    final delay = Duration(seconds: _retry < 5 ? 1 << (_retry - 1) : 10); // 1,2,4,8,10…
+    final delay = state == CallState.connected
+        ? const Duration(seconds: 1) // in a call: retry fast, signaling is needed to recover
+        : Duration(seconds: _retry < 5 ? 1 << (_retry - 1) : 10); // 1,2,4,8,10…
     _retryTimer?.cancel();
     _retryTimer = Timer(delay, () {
       if (_wantConnected && _ws == null) _open();
@@ -160,10 +169,10 @@ class CallController extends ChangeNotifier {
         _everRegistered = true;
         _retry = 0;
         _ping?.cancel();
-        _ping = Timer.periodic(const Duration(seconds: 10), (_) {
+        _ping = Timer.periodic(const Duration(seconds: 4), (_) {
           final ch = _ws;
           if (ch == null) return;
-          if (DateTime.now().difference(_lastRx) > const Duration(seconds: 25)) {
+          if (DateTime.now().difference(_lastRx) > const Duration(seconds: 10)) {
             ch.sink.close(); // server silent: treat as dead and reconnect
             _onSocketLost(ch);
             return;
@@ -187,13 +196,14 @@ class CallController extends ChangeNotifier {
         }
         _pendingOffer = m;
         isCaller = false;
+        speakerOn = true;
         peerId = from;
         state = CallState.incoming;
         statusText = 'Incoming call';
         muted = false;
         duration = Duration.zero;
         _send({'type': 'ringing', 'to': from});
-        _playTone('ring.wav');
+        _playTone('ring.wav', inCall: false);
         _openCallPage();
         notifyListeners();
         break;
@@ -201,7 +211,7 @@ class CallController extends ChangeNotifier {
         if (state == CallState.calling && from == peerId) {
           state = CallState.ringing;
           statusText = 'Ringing…';
-          _playTone('ringback.wav');
+          _playTone('ringback.wav', inCall: true);
           notifyListeners();
         }
         break;
@@ -269,6 +279,7 @@ class CallController extends ChangeNotifier {
     if (!registered || state != CallState.idle || to.isEmpty) return;
     peerId = to;
     isCaller = true;
+    speakerOn = true;
     state = CallState.calling;
     statusText = 'Calling…';
     muted = false;
@@ -321,6 +332,14 @@ class CallController extends ChangeNotifier {
     _finish('Call ended');
   }
 
+  Future<void> toggleSpeaker() async {
+    speakerOn = !speakerOn;
+    try {
+      await Helper.setSpeakerphoneOn(speakerOn);
+    } catch (_) {}
+    notifyListeners();
+  }
+
   void toggleMute() {
     muted = !muted;
     for (final t in _localStream?.getAudioTracks() ?? <MediaStreamTrack>[]) {
@@ -361,12 +380,30 @@ class CallController extends ChangeNotifier {
         'sdpMLineIndex': c.sdpMLineIndex,
       });
     };
+    try {
+      await Helper.setSpeakerphoneOn(speakerOn);
+    } catch (_) {}
     _pc!.onConnectionState = (s) {
+      _pcState = s.name.replaceFirst('RTCPeerConnectionState', '');
+      notifyListeners();
       if (state != CallState.connected) return;
       if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
         _recovered();
       } else if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
           s == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        _startReconnecting();
+      }
+    };
+    // Also watch ICE state directly: some Android builds report it more reliably.
+    _pc!.onIceConnectionState = (s) {
+      _iceState = s.name.replaceFirst('RTCIceConnectionState', '');
+      notifyListeners();
+      if (state != CallState.connected) return;
+      if (s == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          s == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        _recovered();
+      } else if (s == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+          s == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
         _startReconnecting();
       }
     };
@@ -384,7 +421,12 @@ class CallController extends ChangeNotifier {
       _finish('Call failed: connection lost', alert: true);
     });
     _restartTimer?.cancel();
-    _restartTimer = Timer.periodic(const Duration(seconds: 4), (_) => _tryRestartIce());
+    _restartTimer = Timer.periodic(const Duration(seconds: 3), (_) => _tryRestartIce());
+    final ch = _ws;
+    if (ch != null && DateTime.now().difference(_lastRx) > const Duration(seconds: 3)) {
+      ch.sink.close(); // same outage probably killed signaling too: reconnect it now
+      _onSocketLost(ch);
+    }
     _tryRestartIce();
     notifyListeners();
   }
@@ -409,10 +451,17 @@ class CallController extends ChangeNotifier {
         if (ld != null) _send({'type': 'reoffer', 'to': peerId, 'sdp': ld.sdp});
         return;
       }
-      await pc.restartIce();
-      final offer = await pc.createOffer();
+      try {
+        await pc.restartIce();
+      } catch (_) {}
+      // IceRestart constraint is a fallback in case restartIce() is unavailable.
+      final offer = await pc.createOffer({
+        'mandatory': {'IceRestart': true},
+      });
       await pc.setLocalDescription(offer);
+      _restarts++;
       _send({'type': 'reoffer', 'to': peerId, 'sdp': offer.sdp});
+      notifyListeners();
     } catch (_) {}
   }
 
@@ -487,12 +536,30 @@ class CallController extends ChangeNotifier {
   }
 
   // ---------- tones ----------
-  Future<void> _playTone(String asset) async {
+  Future<void> _playTone(String asset, {required bool inCall}) async {
     try {
+      toneError = null;
       await _tone.stop();
+      // Caller's mic is already open (call-audio mode): play on the call-signalling stream.
+      await _tone.setAudioContext(AudioContext(
+        android: AudioContextAndroid(
+          isSpeakerphoneOn: inCall ? speakerOn : false,
+          stayAwake: false,
+          contentType: AndroidContentType.sonification,
+          usageType: inCall
+              ? AndroidUsageType.voiceCommunicationSignalling
+              : AndroidUsageType.notificationRingtone,
+          audioFocus: inCall ? AndroidAudioFocus.none : AndroidAudioFocus.gain,
+          audioMode: inCall ? AndroidAudioMode.inCommunication : AndroidAudioMode.normal,
+        ),
+      ));
+      await _tone.setVolume(1.0);
       await _tone.setReleaseMode(ReleaseMode.loop);
       await _tone.play(AssetSource(asset));
-    } catch (_) {}
+    } catch (e) {
+      toneError = 'Tone error: $e';
+      notifyListeners();
+    }
   }
 
   Future<void> _stopTone() async {
@@ -747,6 +814,14 @@ class CallPage extends StatelessWidget {
                 ),
                 const Spacer(flex: 3),
                 Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text(
+                    '${ctrl.debugLine}${ctrl.toneError != null ? '\n${ctrl.toneError}' : ''}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white38, fontSize: 11),
+                  ),
+                ),
+                Padding(
                   padding: const EdgeInsets.only(bottom: 48),
                   child: s == CallState.incoming
                       ? Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
@@ -762,6 +837,13 @@ class CallPage extends StatelessWidget {
                             color: ctrl.muted ? Colors.white : Colors.white24,
                             iconColor: ctrl.muted ? Colors.black : Colors.white,
                             onTap: connected ? ctrl.toggleMute : null,
+                          ),
+                          _RoundButton(
+                            icon: ctrl.speakerOn ? Icons.volume_up : Icons.hearing,
+                            label: ctrl.speakerOn ? 'Speaker' : 'Earpiece',
+                            color: ctrl.speakerOn ? Colors.white : Colors.white24,
+                            iconColor: ctrl.speakerOn ? Colors.black : Colors.white,
+                            onTap: s == CallState.ended ? null : ctrl.toggleSpeaker,
                           ),
                           _RoundButton(
                             icon: Icons.call_end,
